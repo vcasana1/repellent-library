@@ -1,0 +1,337 @@
+name: Fetch open-access PDFs
+
+# Lanzar a mano: pestana Actions > "Fetch open-access PDFs" > Run workflow.
+# Descarga solo copias de acceso abierto legales (via OpenAlex / Europe PMC /
+# enlaces directos de documentos oficiales). No usa credenciales de nadie.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Write script and reference list
+        run: |
+          cat > fetch_oa.py <<'PYEOF'
+          #!/usr/bin/env python3
+          """Descarga PDF de acceso abierto legal para la bibliografia de la revision.
+
+          Para cada DOI pregunta a OpenAlex que copias de acceso abierto existen
+          (editorial, PMC, repositorios), y prueba cada candidata hasta obtener un PDF
+          de verdad (cabecera %PDF y tamano minimo). No usa credenciales de nadie, no
+          intenta saltarse muros de pago ni proteccion anti-bot: si una editorial
+          responde 403, se anota y se sigue. Pausas entre peticiones.
+          Solo libreria estandar. Se puede relanzar: salta lo que ya esta en pdfs/.
+          """
+          import csv, json, os, re, sys, time, urllib.error, urllib.parse, urllib.request
+
+          UA = ("repellent-library-fetcher/1.0 (revision bibliografica; "
+                "https://github.com/vcasana1/repellent-library)")
+          DELAY = float(os.environ.get("FETCH_DELAY", "3"))   # s entre peticiones a editoriales
+          MIN_BYTES = 30_000
+          MAX_BYTES = 80_000_000
+          LIST = os.environ.get("FETCH_LIST", "fetch_list.csv")
+          OUT = "pdfs"
+          REPORT = "report/fetch_report.csv"
+
+
+          def get(url, timeout=60):
+              """(status, content_type, bytes, final_url) o lanza excepcion."""
+              req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "*/*"})
+              with urllib.request.urlopen(req, timeout=timeout) as r:
+                  data = r.read(MAX_BYTES + 1)
+                  return r.status, r.headers.get("Content-Type", ""), data, r.geturl()
+
+
+          def is_pdf(data):
+              return data[:5] == b"%PDF-" and MIN_BYTES <= len(data) <= MAX_BYTES
+
+
+          def openalex_candidates(doi):
+              """URLs candidatas de PDF segun OpenAlex, mas notas de diagnostico."""
+              q = urllib.parse.quote(doi, safe="/")
+              url = ("https://api.openalex.org/works?filter=doi:" + q +
+                     "&per-page=1&select=open_access,best_oa_location,locations,ids")
+              try:
+                  _, _, data, _ = get(url, timeout=40)
+                  res = json.loads(data).get("results") or []
+              except Exception as e:                      # red, JSON, 4xx...
+                  return [], f"openalex_error:{type(e).__name__}"
+              time.sleep(0.3)
+              if not res:
+                  return [], "openalex_no_record"
+              w = res[0]
+              cands = []
+              best = (w.get("best_oa_location") or {}).get("pdf_url")
+              if best:
+                  cands.append(best)
+              for loc in w.get("locations") or []:
+                  if loc.get("is_oa") and loc.get("pdf_url"):
+                      cands.append(loc["pdf_url"])
+              pmc = (w.get("ids") or {}).get("pmcid") or ""
+              m = re.search(r"PMC\d+", pmc, re.I)
+              if m:
+                  cands.append("https://europepmc.org/backend/ptpmcrender.fcgi?accid="
+                               f"{m.group(0).upper()}&blobtype=pdf")
+              is_oa = (w.get("open_access") or {}).get("is_oa")
+              if is_oa and doi.startswith(("10.1186/", "10.1007/")):
+                  cands.append(f"https://link.springer.com/content/pdf/{urllib.parse.quote(doi, safe='/')}.pdf")
+              seen, uniq = set(), []
+              for c in cands:
+                  if c not in seen:
+                      seen.add(c)
+                      uniq.append(c)
+              note = "oa" if is_oa else "openalex_not_oa"
+              return uniq, note
+
+
+          def try_download(cands):
+              """Devuelve (bytes|None, url_usada, motivo)."""
+              last = "sin_candidatas"
+              for u in cands:
+                  try:
+                      status, ctype, data, final = get(u)
+                  except urllib.error.HTTPError as e:
+                      last = f"http_{e.code}"
+                  except Exception as e:
+                      last = type(e).__name__
+                  else:
+                      if is_pdf(data):
+                          return data, final, "ok"
+                      last = "no_es_pdf" if len(data) >= 1000 else "respuesta_corta"
+                  time.sleep(DELAY)
+              return None, "", last
+
+
+          def main():
+              os.makedirs(OUT, exist_ok=True)
+              os.makedirs(os.path.dirname(REPORT), exist_ok=True)
+              rows = list(csv.DictReader(open(LIST, encoding="utf-8")))
+              limit = int(os.environ.get("FETCH_LIMIT", "0")) or len(rows)
+              rows = rows[:limit]
+              rep = []
+              n_ok = 0
+              for i, r in enumerate(rows, 1):
+                  key, doi, fn, url = r["key"], r["doi"].strip(), r["pdf_filename"], r["url"].strip()
+                  path = os.path.join(OUT, fn)
+                  if os.path.exists(path) and os.path.getsize(path) >= MIN_BYTES:
+                      rep.append([key, doi, "ya_estaba", "", os.path.getsize(path), ""])
+                      n_ok += 1
+                      print(f"[{i}/{len(rows)}] {key}: ya estaba", flush=True)
+                      continue
+                  cands, note = [], ""
+                  if doi:
+                      cands, note = openalex_candidates(doi)
+                  if url and not doi:                      # sin DOI: enlace directo (docs oficiales)
+                      cands = [url]
+                      note = "url_directa"
+                  data, used, why = try_download(cands)
+                  if data:
+                      tmp = path + ".part"
+                      with open(tmp, "wb") as f:
+                          f.write(data)
+                      os.replace(tmp, path)
+                      n_ok += 1
+                      rep.append([key, doi, "ok", used, len(data), note])
+                      print(f"[{i}/{len(rows)}] {key}: OK {len(data)//1024} KB <- {used[:70]}", flush=True)
+                  else:
+                      status = "sin_copia_abierta" if note in ("openalex_not_oa", "openalex_no_record") and not cands else "fallo"
+                      rep.append([key, doi, status, ";".join(cands)[:300], 0, f"{note}|{why}"])
+                      print(f"[{i}/{len(rows)}] {key}: {status} ({note}|{why})", flush=True)
+                  time.sleep(DELAY)
+              with open(REPORT, "w", encoding="utf-8", newline="") as f:
+                  w = csv.writer(f)
+                  w.writerow(["key", "doi", "estado", "url_o_candidatas", "bytes", "nota"])
+                  w.writerows(rep)
+              print(f"\nTerminado: {n_ok}/{len(rows)} PDF obtenidos. Informe en {REPORT}", flush=True)
+
+
+          if __name__ == "__main__":
+              main()
+          PYEOF
+          cat > fetch_list.csv <<'CSVEOF'
+          key,doi,pdf_filename,open_access,url
+          AbdelGhaffar2015length,10.1007/s00436-015-4506-z,AbdelGhaffar_2015_Icaridin_Formulation_Tick_Repellency.pdf,no,
+          Abrantes2021development,10.3389/fphar.2021.760682,Abrantes_2021_Mosquito_Repellent_NLC_Icaridin.pdf,yes,https://www.frontiersin.org/journals/pharmacology/articles/10.3389/fphar.2021.760682/full
+          Abrantes2022repellent,10.1186/s12951-022-01729-7,Abrantes_2022_IR3535_PCL_Nanoparticles_Arboviruses.pdf,yes,https://jnanobiotechnology.biomedcentral.com/articles/10.1186/s12951-022-01729-7
+          Abudu2025evaluation,10.1186/s13071-025-06946-1,Abudu_2025_IR3535_Staytec_Sustained_Release_Ghana.pdf,yes,https://pmc.ncbi.nlm.nih.gov/articles/PMC12505549/
+          AERUir3535,,AERU_IR3535_BPDB_Record_Hertfordshire.pdf,yes,https://sitem.herts.ac.uk/aeru/bpdb/Reports/2194.htm
+          Afify2019commonly,10.1016/j.cub.2019.09.007,Afify_2019_Repellents_Hide_Human_Odors_From_Anopheles.pdf,no,
+          Agramonte2017comparative,10.1093/jme/tjw207,Agramonte_2017_Silicone_Membrane_Alternative_Skin_Testing_Mosquito_Repellents.pdf,no,https://bioone.org/journals/journal-of-medical-entomology/volume-54/issue-3/tjw207/Comparative-Evaluation-of-a-Silicone-Membrane-as-an-Alternative-to/10.1093/jme/tjw207.full
+          Andrade2022polymeric,10.3390/ijms23158317,Andrade_2022_Polymeric_Nanorepellent_Icaridin_PCL.pdf,yes,https://www.mdpi.com/1422-0067/23/15/8317
+          Andreev2026novel,10.21684/0132-8077-2026-34-1-115-121,Andreev_2026_Climbing_Test_IR3535_DEET_Icaridin_Ixodes_persulcatus.pdf,yes,https://acarina.utmn.ru/journal/release/2026/34-1/1367147/
+          Antwi2008risk,10.1016/j.yrtph.2008.03.002,Antwi_2008_Risk_Assessments_DEET_And_Picaridin.pdf,no,
+          ASTM2000e939,10.1520/E0939-94R00,ASTM_2000_E939_Field_Testing_Topical_Repellents_Mosquitoes.pdf,no,https://store.astm.org/e0939-94r00.html
+          Badolo2004evaluation,10.1111/j.1365-3156.2004.01206.x,Badolo_2004_Sensitivity_Aedes_Anopheles_DEET_KBR3023.pdf,no,
+          Barcelos2024commercial,10.3390/pathogens13010009,Barcelos_2024_Commercial_Repellents_Amblyomma_sculptum.pdf,yes,https://www.mdpi.com/2076-0817/13/1/9
+          Barnard2002repellency,10.1603/0022-2585-39.6.895,Barnard_2002_Repellency_IR3535_KBR3023_Deet_Everglades.pdf,no,
+          Barnard2004laboratory,10.1603/0022-2585-41.4.726,Barnard_2004_Laboratory_Evaluation_Mosquito_Repellents.pdf,no,
+          Barnard2005biological,10.2987/8756-971X(2005)21[12:BAMFMR]2.0.CO;2,Barnard_2005_Biological_Assay_Methods_Mosquito_Repellents.pdf,no,
+          Barradas2016polymer,10.2174/1567201813666151207110515,Barradas_2016_Polymer_Based_Drug_Delivery_Insect_Repellents_Review.pdf,no,
+          Bissinger2010tick,10.1016/j.pestbp.2009.09.010,Bissinger_2010_Tick_Repellents_Past_Present_Future.pdf,no,
+          Bohbot2010insect,10.1371/journal.pone.0012138,Bohbot_2010_Repellents_Modulate_Mosquito_Odorant_Receptors.pdf,yes,https://journals.plos.org/plosone/article?id=10.1371/journal.pone.0012138
+          Bonadies2018electrospun,10.1063/1.5045974,Bonadies_2018_Electrospun_PLLA_Fibers_Containing_DEET.pdf,no,
+          Bonadies2019biodegradable,10.1016/j.eurpolymj.2019.02.001,Bonadies_2019_Electrospun_PLLA_Fibers_DEET.pdf,no,
+          Buchel2015repellent,10.1016/j.ttbdis.2015.03.019,Buchel_2015_DEET_Icaridin_EBAAP_Ixodes.pdf,no,
+          Buchel2025comparative,,Buchel_2025_Exotic_Tick_Species_Repellent_Registration.pdf,yes,https://icup.org.uk/conferences/2025/posters/comparative-study-of-exotic-tick-species-for-human-repellent-registration/
+          Buka2004sunscreens,10.1097/01.mop.0000133082.32384.76,Buka_2004_Sunscreens_And_Insect_Repellents.pdf,no,
+          Burtis2023comparison,10.1186/s13071-023-05845-7,Burtis_2023_In_Vitro_In_Vivo_Bioassays_Ixodes_scapularis.pdf,yes,https://parasitesandvectors.biomedcentral.com/articles/10.1186/s13071-023-05845-7
+          Burtis2024efficacy,10.1186/s13071-024-06146-3,Burtis_2024_Minimum_Risk_Tick_Repellents_Human_Skin.pdf,yes,https://parasitesandvectors.biomedcentral.com/articles/10.1186/s13071-024-06146-3
+          Carroll2004comparative,10.1603/0022-2585-41.2.249,Carroll_2004_Comparative_Deet_AI3-37220_Ticks.pdf,yes,https://www.ars.usda.gov/ARSUserFiles/3122/CarrollEtAl2004.pdf
+          Carroll2008prolonged,10.1093/jmedent/45.4.706,Carroll_2008_Prolonged_Efficacy_IR3535.pdf,no,
+          Carroll2008twelve,10.1111/j.1365-2915.2008.00721.x,Carroll_2008_Twelve_Hour_Cream_Formulations_Amblyomma.pdf,unknown,
+          Carroll2010formulations,10.1603/ME09239,Carroll_2010_Deet_Picaridin_IR3535_Lone_Star_Tick.pdf,no,
+          Carroll2014solvent,10.1603/ME12214,Carroll_2014_Solvent_Drying_Substrate_Deet_Picaridin.pdf,yes,https://www.ars.usda.gov/ARSUserFiles/3122/CarrollEtAl2014.pdf
+          Cecone2018controlled,10.3390/molecules23071694,Cecone_2018_DEET_Electrospun_Cyclodextrin_Fibrous_Mats.pdf,yes,https://www.mdpi.com/1420-3049/23/7/1694
+          Chauhan2021evaluation,10.1093/jme/tjab065,Chauhan_2021_Verdegen_Repellent_Gel.pdf,no,
+          Colucci2014evaluation,,Colucci_2014_Evaluation_Topical_Repellents_Interpretation_Efficacy_Data_ICUP.pdf,yes,https://icup.org.uk/media/4j4nwprf/icup1105.pdf
+          Colucci2017evaluation,10.5451/unibas-006808320,Colucci_2017_Evaluation_Laboratory_Field_Methods_Repellent_Efficacy_Thesis.pdf,yes,https://edoc.unibas.ch/62558
+          Colucci2018evaluation,10.1038/s41598-018-30998-2,Colucci_2018_Field_vs_Lab_Methods_Protection_Times_PMD_DEET.pdf,yes,https://www.nature.com/articles/s41598-018-30998-2
+          Costantini2004field,10.1016/j.trstmh.2003.12.015,Costantini_2004_Field_Efficacy_Persistence_DEET_IR3535_KBR3023.pdf,no,
+          Curtis1987relative,10.1111/j.1365-2915.1987.tb00331.x,Curtis_1987_Relative_Efficacy_Repellents_Mosquito_Vectors_Disease.pdf,no,
+          DagarRamakrishna2024plant,10.1007/s42690-024-01329-y,DagarRamakrishna2024plant.pdf,no,https://link.springer.com/article/10.1007/s42690-024-01329-y
+          Dautel2002invivo,,Dautel_2002_In_Vivo_Test_Ixodes_ricinus_Repellents.pdf,yes,https://icup.org.uk/conferences/2002/papers/in-vivo-test-method-for-repellents-against-the-hard-tick-ixodes-ricinus-acari-ixodidae-main-vector-of-lyme-borreliosis-and-tbe-in-europe/
+          Dautel2013efficacy,10.1016/j.ttbdis.2012.11.007,Dautel_2013_Ixodes_ricinus_Repellents_Different_Assays.pdf,no,
+          Daza2020polymer,10.1007/s00396-020-04639-y,Daza_2020_Polymer_Coated_Silica_Nanoparticles_Pickering.pdf,no,
+          Debboun2014handbook,10.1201/b17407,Debboun_2014_Insect_Repellents_Handbook_2nd_Edition.pdf,no,https://www.taylorfrancis.com/books/edit/10.1201/b17407/insect-repellents-handbook
+          DeGennaro2013orco,10.1038/nature12206,DeGennaro_2013_Orco_Mutant_Mosquitoes_Not_Repelled_By_Volatile_DEET.pdf,no,
+          DeGennaro2015mysterious,10.1080/19336934.2015.1079360,DeGennaro_2015_Mysterious_Multi_Modal_Repellency_DEET.pdf,yes,https://www.tandfonline.com/doi/pdf/10.1080/19336934.2015.1079360
+          Dennis2019aedes,10.1016/j.cub.2019.04.004,Dennis_2019_Aedes_Legs_Sense_DEET_On_Contact.pdf,no,
+          Diaz2016chemical,10.1016/j.wem.2015.11.007,Diaz_2016_Chemical_Plant_Based_Insect_Repellents_Efficacy_Safety.pdf,no,
+          Dickens2013minireview,10.1016/j.pestbp.2013.02.006,Dickens_2013_Mini_Review_Mode_of_Action_Mosquito_Repellents.pdf,no,
+          Ditzen2008insect,10.1126/science.1153121,Ditzen_2008_Odorant_Receptors_Molecular_Targets_DEET.pdf,no,
+          Donchai2022controlled,10.29090/psa.2022.05.22.110,Donchai_2022_Controlled_Release_DEET_Picaridin_Coacervation.pdf,yes,https://pharmacy.mahidol.ac.th/journal/_files/2022-49-5_12.pdf
+          ECHA2023efficacy,,ECHA_2023_BPR_Volume_II_Efficacy_Parts_B_C.pdf,yes,https://echa.europa.eu/guidance-documents/guidance-on-biocides-legislation
+          ECHAhumanhealth,,ECHA_Guidance_BPR_Volume_III_Human_Health_Part_B.pdf,yes,https://www.echa.europa.eu/documents/10162/15623299/biocides_guidance_human_health_ra_iii_part_bc_en.pdf/30d53d7d-9723-7db4-357a-ca68739f5094
+          EPA2010LNX003,,EPA_2010_Science_Review_LNX003_Picaridin_Ticks.pdf,yes,https://archive.epa.gov/hsrb/web/pdf/2g_epa_science_rvw_clbr_lnx-003_5-24-10a1.pdf
+          EU2010deetdirective,,EC_2010_Directive_2010_51_EU_DEET_PT19.pdf,yes,https://eur-lex.europa.eu/eli/dir/2010/51/oj/eng
+          EU2012bpr,,EU_2012_Regulation_528_2012_Biocidal_Products_Regulation.pdf,yes,https://eur-lex.europa.eu/eli/reg/2012/528/oj
+          EU2014ir3535,,EC_2014_Implementing_Regulation_406_2014_IR3535_PT19.pdf,yes,https://eur-lex.europa.eu/legal-content/EN/TXT/?uri=CELEX:32014R0406
+          EU2020icaridin,,EC_2020_Implementing_Regulation_2020_1086_Icaridin_PT19.pdf,yes,https://eur-lex.europa.eu/eli/reg_impl/2020/1086/oj
+          Fediuk2010tissue,10.1177/1091581810380147,Fediuk_2010_Tissue_Deposition_DEET_Oxybenzone_Repeated_Topical.pdf,no,
+          Fediuk2011tissue,10.1002/bdd.765,Fediuk_2011_Tissue_Disposition_DEET_Oxybenzone_IV_And_Topical.pdf,no,
+          Fernandes2021efficacy,10.1016/j.tmaid.2021.102179,Fernandes_2021_Efficacy_Safety_Repellents_Brazil_Systematic_Review.pdf,no,
+          Fradin1998mosquitoes,10.7326/0003-4819-128-11-199806010-00013,Fradin_1998_Mosquitoes_Mosquito_Repellents_Clinicians_Guide.pdf,no,
+          Fradin2002comparative,10.1056/NEJMoa011699,Fradin_2002_Comparative_Efficacy_Insect_Repellents.pdf,no,https://www.nejm.org/doi/full/10.1056/NEJMoa011699
+          Frances2004field,10.1603/0022-2585-41.3.414,Frances_2004_Field_Deet_Picaridin_Northern_Territory.pdf,no,
+          Frances2009comparative,10.2987/Moco-09-5938.1,Frances_2009_Comparative_Field_Deet_IR3535_Queensland.pdf,no,
+          Frances2013field,10.2987/13-6348R.1,Frances_2013_Field_Eval_User_Acceptability_Deet.pdf,no,
+          Frances2014comparative,10.2987/13-6366.1,Frances_2014_Comparative_Deet_Ethanol_Queensland.pdf,no,
+          Gervais2009picaridintech,,Gervais_2009_Picaridin_Technical_Fact_Sheet_NPIC.pdf,yes,https://npic.orst.edu/factsheets/archive/Picaridintech.html
+          Golenda1999gender,10.4269/ajtmh.1999.60.654,Golenda_1999_Gender_Extended_Duration_DEET.pdf,unknown,
+          Gomes2019encapsulation,10.1002/app.47139,Gomes_2019_DEET_Miniemulsion_Polymerization_Temperature_Release.pdf,no,
+          Goodyer2010expert,10.1111/j.1708-8305.2010.00402.x,Goodyer_2010_Expert_Review_Evidence_Base_Arthropod_Bite_Avoidance.pdf,no,
+          Goodyer2018mosquito,10.1093/jtm/tay005,Goodyer_2018_Picaridin_vs_DEET_Longer_Protection_Traveller.pdf,yes,https://academic.oup.com/jtm/article-pdf/25/suppl_1/S10/27714235/tay005.pdf
+          Govere2000efficacy,10.1046/j.1365-2915.2000.00261.x,Govere_2000_Three_Repellents_An_arabiensis.pdf,no,
+          Gu2004invitro,10.1211/0022357023402,Gu_2004_In_Vitro_Permeation_DEET_And_Oxybenzone.pdf,no,
+          Gu2009invitro,10.1080/10837450802647318,Gu_2009_Invitro_Permeation_Picaridin_Oxybenzone.pdf,no,
+          Gupta1989cage,,Gupta_1989_Improved_Laboratory_Test_Cage_Repellents.pdf,yes,https://biodiversitylibrary.org/part/126093
+          Gupta1989laboratory,10.1093/jmedent/26.5.468,Gupta_1989_Face_Paint_Repellent_Climatic.pdf,no,
+          GutierrezBeleno2023efficient,10.21577/0103-5053.20220084,GutierrezBeleno_2023_DEET_Emulsions_Nanocellulose_Silica.pdf,yes,https://scielo.br/j/jbchs/a/rt4gwkgWGB8Drjp9CshZX4p/?lang=en
+          Hexsel2008current,10.1016/j.jaad.2008.03.038,Hexsel_2008_Sunscreen_Labelling_Combination_Repellent_Products.pdf,no,
+          Iscan2006deet,10.1080/02652040500444198,Iscan_2006_DEET_Solid_Lipid_Particles.pdf,no,
+          Jackson2008deettech,,Jackson_2008_DEET_Technical_Fact_Sheet_NPIC.pdf,yes,https://npic.orst.edu/factsheets/archive/DEETtech.html
+          Jensenius2005repellent,10.1016/j.trstmh.2005.01.006,Jensenius_2005_Four_DEET_Lotions_Amblyomma_hebraeum.pdf,no,
+          Kadam2019sustained,10.1016/j.colsurfa.2019.123883,Kadam_2019_Sustained_Release_Repellent_Microcapsules_Pickering_mCNF.pdf,no,
+          Karr2012novel,10.1016/j.jconrel.2012.04.023,Karr_2012_Novel_Encapsulation_DEET_Absorption_Evaporation.pdf,no,
+          Kasichayanula2007percutaneous,10.1016/j.taap.2007.05.016,Kasichayanula_2007_Percutaneous_DEET_And_Oxybenzone.pdf,no,
+          Kasting2008microencapsulation,10.1016/j.tiv.2007.11.003,Kasting_2008_Microencapsulation_Decreases_Skin_Absorption_DEET.pdf,no,
+          Kasting2008spreadsheet,10.1080/15459620802304245,Kasting_2008_Spreadsheet_Model_Skin_Disposition_Volatiles_DEET.pdf,no,
+          Katz2008insect,10.1016/j.jaad.2007.10.005,Katz_2008_Insect_Repellents_Historical_Perspectives_New_Developments.pdf,no,
+          Kawaguchi2023poly,10.1371/journal.pone.0292447,Kawaguchi_2023_POE_POP_Butyl_Ether_Prolongs_DEET_Repellency.pdf,yes,https://journals.plos.org/plosone/article?id=10.1371/journal.pone.0292447
+          Khan1973study,10.1093/jee/66.2.437,Khan_1973_Temperature_Protection_Time.pdf,no,https://academic.oup.com/jee/article/66/2/437/2211664
+          Khan1975addition,,Khan_1975_Vanillin_Repellent_Protection_Time.pdf,yes,https://www.biodiversitylibrary.org/part/130578
+          Klun2000module,10.1603/0022-2585-37.1.177,Klun_2000_New_Module_Quantitative_Evaluation_Repellent_Efficacy.pdf,no,
+          Klun2005invitro,10.2987/8756-971X(2005)21[64:ANIVBS]2.0.CO;2,Klun_2005_New_In_Vitro_Bioassay_System_Repellents.pdf,no,
+          Klun2006repellent,10.1603/0022-2585(2006)043[0034:RADEOS]2.0.CO;2,Klun_2006_SS220_Picaridin_Deet_Blood_Feeding.pdf,no,
+          Koren2003deet,,Koren_2003_DEET_Repellents_Children_Pregnancy_Lactation.pdf,yes,https://pmc.ncbi.nlm.nih.gov/articles/PMC167123/
+          Kroeber2013standardised,10.1016/j.pestbp.2013.06.008,Kroeber_2013_Standardised_Tick_Repellent_Test.pdf,unknown,https://libra.unine.ch/handle/20.500.14713/52670
+          Lajeunesse2020infected,10.1093/jme/tjz209,Lajeunesse_2020_Infected_Mosquitoes_Altered_Behavior_Repellents_Meta_Analysis.pdf,no,
+          Lawrence2014field,10.1603/ME14075,Lawrence_2014_Field_Evaluations_Topical_Arthropod_Repellents_Americas.pdf,no,
+          Licciardi2006lethal,10.1111/j.1365-2915.2006.00630.x,Licciardi_2006_Lethal_Behavioural_Effects_DEET_IR3535_KBR3023_Aedes.pdf,no,
+          Luker2024critical,10.3389/finsc.2024.1320138,Luker_2024_Critical_Review_Laboratory_Methods_Mosquito_Repellents.pdf,yes,https://www.frontiersin.org/journals/insect-science/articles/10.3389/finsc.2024.1320138/full
+          Lupi2013efficacy,10.1016/j.tmaid.2013.10.005,Lupi_2013_Efficacy_Repellents_Aedes_Anopheles_Culex_Ixodes_Review.pdf,no,
+          Mapossa2021mosquito,10.1186/s12936-021-03681-7,Mapossa_2021_Mosquito_Repellent_Controlled_Release_Formulations.pdf,yes,https://pmc.ncbi.nlm.nih.gov/articles/PMC7988998/
+          Mapossa2024electrospun,10.1002/mame.202400130,Mapossa_2024_Electrospun_Nanofibers_Malaria_Repellent_Review.pdf,unknown,
+          Mbuba2021single,10.1186/s12936-020-03461-9,Mbuba_2021_MAIA_Ointment_vs_Unformulated_DEET.pdf,yes,https://pmc.ncbi.nlm.nih.gov/articles/PMC7788821/
+          McGready2001safety,10.4269/ajtmh.2001.65.285,McGready_2001_Safety_Of_DEET_In_Pregnancy.pdf,yes,
+          Mehr1985laboratory,,Mehr_1985_Laboratory_Evaluation_Controlled_Release_Repellent_Formulations.pdf,yes,https://www.biodiversitylibrary.org/part/125530
+          Meng2016evaluation,10.1007/s10493-015-9994-0,Meng_2016_DEET_Essential_Oils_Lone_Star_Tick.pdf,no,
+          Misni2019microencapsulation,10.22037/ijpr.2019.2351,Misni_2019_Microencapsulation_Interfacial_Precipitation_Repellent.pdf,yes,https://brieflands.com/articles/ijpr-126142
+          Montemarano1997insect,10.1016/S0140-6736(05)62637-2,Montemarano_1997_Insect_Repellents_Efficacy_Sunscreens.pdf,no,
+          Moody1990automated,10.1016/0887-2333(90)90021-k,Moody_1990_Automated_In_Vitro_Dermal_Absorption_DEET.pdf,no,
+          Moody1993automated,10.1016/0887-2333(93)90128-r,Moody_1993_Automated_In_Vitro_Dermal_Absorption_III_In_Vivo_Comparison.pdf,no,
+          MorenoGomez2021two,10.1093/jme/tjab050,MorenoGomez_2021_Two_New_Alternatives_Arm_in_Cage_Test.pdf,unknown,https://academic.oup.com/jme/article/58/4/1826/6225231
+          Murphy2000effect,10.1067/mjd.2000.107960,Murphy_2000_Sunscreen_Effect_Insect_Repellent_Trial.pdf,no,
+          Nagai2022nn,10.3390/molecules27103174,Nagai_2022_DEET_Hydroxypropyl_Betacyclodextrin_Skin_Penetration.pdf,yes,https://pmc.ncbi.nlm.nih.gov/articles/PMC9146378/
+          Nair2021development,10.4274/tjps.galenos.2020.88725,SreedharanNair_2021_DEET_Microparticles_Loaded_Hydrogel.pdf,yes,https://turkjps.org/pdf/68f48462-babf-415b-b878-1e392d1c83af/articles/tjps.galenos.2020.88725/TJPS-18-352-En.pdf
+          Naucke2007field,10.1007/s00436-006-0450-2,Naucke_2007_Field_Eval_IR3535_Picaridin.pdf,no,
+          Nguyen2023insect,10.1016/j.jaad.2018.10.053,Nguyen_2023_Insect_Repellents_Updated_Review_Clinician.pdf,no,
+          Obermayr2010novel,10.1603/ME10093,Obermayr_2010_Novel_Test_Cage_Air_Ventilation_Efficacy_Testing_Repellents.pdf,yes,https://academic.oup.com/jme/article-pdf/47/6/1116/6300464/jmedent47-1116.pdf
+          Osimitz1997neurological,10.3109/15563659709001224,Osimitz_1997_Neurological_Effects_DEET.pdf,no,
+          Osimitz2010adverse,10.1016/j.yrtph.2009.09.004,Osimitz_2010_Adverse_Events_DEET_Repellents.pdf,no,
+          Pages2014tick,10.1089/vbz.2013.1410,Pages_2014_Tick_Repellents_Human_Use.pdf,unknown,
+          Peng2022mosquito,10.3390/molecules27175534,Peng_2022_Commercial_Skin_Applied_Repellents_China.pdf,yes,
+          Pereira2026deet,10.1002/ps.71001,Pereira_2026_DEET_Cyclodextrin_Inclusion_Complexes_Mosquito_Tick.pdf,unknown,https://scijournals.onlinelibrary.wiley.com/doi/10.1002/ps.71001
+          PMRA2017value,,PMRA_2017_Value_Guidelines_Personal_Insect_Repellent_Products.pdf,yes,https://www.canada.ca/en/health-canada/services/consumer-product-safety/reports-publications/pesticides-pest-management/policies-guidelines/value-new-personal-insect-repellent-products-label-amendments.html
+          Pretorius2003repellent,10.1603/0022-2585-40.2.245,Pretorius_2003_DEET_KBR3023_Amblyomma_hebraeum.pdf,unknown,
+          Proniuk2002topical,10.1002/jps.1172,Proniuk_2002_Topical_Formulation_Studies_DEET_Cyclodextrins.pdf,no,
+          Qiu1998formulation,10.1016/s0378-5173(97)00379-7,Qiu_1998_Vehicle_Effects_DEET_In_Vitro_Skin_Permeation.pdf,no,
+          Rogerio2022cellulose,10.1021/acsabm.1c01286,Rogerio_2022_Cellulose_Hydrogel_Zein_Nanoparticles_Icaridin.pdf,no,
+          Ross2000reduction,10.1016/s0168-3659(00)00210-8,Ross_2000_Reduction_Skin_Permeation_DEET_Partition_Coefficient.pdf,no,
+          Ross2004insect,10.1124/dmd.32.8.783,Ross_2004_Sunscreens_Enhance_DEET_Absorption.pdf,yes,https://dmd.aspetjournals.org/content/dmd/32/8/783.full-text.pdf
+          Rutledge1999variation,,Rutledge_1999_Variation_Protection_Periods_Individual_Subjects.pdf,yes,https://www.biodiversitylibrary.org/part/127081
+          Rutledge2006animal,10.1201/9781420006650.ch7,Rutledge_2006_Animal_Models_Repellent_Development.pdf,no,
+          Salafsky2000short,10.4269/ajtmh.2000.62.169,Salafsky_2000_Long_Acting_DEET_Tick_Attachment.pdf,yes,https://www.ajtmh.org/view/journals/tpmd/62/2/article-p169.xml
+          Santhanam2004absorption,10.1016/j.taap.2004.08.016,Santhanam_2004_Absorption_And_Evaporation_DEET_Human_Skin.pdf,no,
+          Schofield2007exercise,10.1093/jmedent/44.6.1026,Schofield_2007_Exercise_Regular_Polymer_Deet.pdf,no,
+          Schofield2007field,10.1093/jmedent/44.3.457,Schofield_2007_Regular_Polymer_Deet_Manitoba.pdf,no,https://academic.oup.com/jme/article/44/3/457/854763
+          Schwantes2008prevention,10.1186/1756-3305-1-8,Schwantes_2008_Dodecanoic_Acid_Ixodes_ricinus.pdf,yes,https://parasitesandvectors.biomedcentral.com/articles/10.1186/1756-3305-1-8
+          Scott2014laboratory,10.2987/13-6368.1,Scott_2014_Lab_Eval_Picaridin_Deet_Psorophora.pdf,no,
+          Selim1995absorption,10.1006/faat.1995.1043,Selim_1995_Absorption_Metabolism_Excretion_DEET_Human_Volunteers.pdf,no,
+          Semmler2011comparison,10.1007/s00436-010-2131-4,Semmler_2011_Tick_Repellent_Products_Europe_USA.pdf,no,
+          Silva2024development,10.1016/j.jddst.2024.106297,Silva_2024_Icaridin_Repellent_Gel_Formulations_Efficacy.pdf,no,
+          Soares2010repellent,10.4322/rbpv.01901003,Soares_2010_DEET_Amblyomma_cajennense_Bioassays.pdf,yes,https://www.redalyc.org/pdf/3978/397841475003.pdf
+          Solberg1995field,10.1093/jmedent/32.6.870,Solberg_1995_Field_Deet_AI3-37220_Amblyomma.pdf,unknown,
+          Staub2002effectiveness,10.1580/1080-6032(2002)013[0012:EOARCD]2.0.CO;2,Staub_2002_DEET_EBAAP_Tick_Bites_Field_Trial.pdf,no,
+          Straumer2008invitro,10.17169/refubium-9774,Straumer_2008_In_Vitro_Methods_Tick_Repellents.pdf,yes,https://refubium.fu-berlin.de/handle/fub188/5575
+          Sudakin2003deet,10.1081/CLT-120025348,Sudakin_2003_DEET_Review_Update_Safety_And_Risk.pdf,no,
+          Syed2008mosquitoes,10.1073/pnas.0805312105,Syed_2008_Mosquitoes_Smell_And_Avoid_DEET.pdf,yes,https://www.pnas.org/doi/10.1073/pnas.0805312105
+          Tavares2018trends,10.1016/j.ijpharm.2018.01.046,Tavares_2018_Trends_Insect_Repellent_Formulations_Review.pdf,no,
+          Thavara2001laboratory,,Thavara_2001_IR3535_Deet_Thailand.pdf,yes,https://www.biodiversitylibrary.org/part/127207
+          USEPA1998red,,USEPA_1998_DEET_Reregistration_Eligibility_Decision.pdf,yes,https://archive.epa.gov/pesticides/reregistration/web/pdf/0002red.pdf
+          USEPA1998redfacts,,USEPA_1998_RED_Facts_DEET.pdf,yes,https://archive.epa.gov/pesticides/reregistration/web/pdf/0002fact.pdf
+          USEPA2010oppts,,USEPA_2010_OPPTS_810_3700_Insect_Repellents_Human_Skin.pdf,yes,https://www.epa.gov/system/files/documents/2023-12/1d.-oppts-810.3700-guidelines-july-7-2010.pdf
+          USEPAir3535,,USEPA_IR3535_113509_Cleared_Reviews_Index.pdf,yes,https://archive.epa.gov/pesticides/chemicalsearch/chemical/foia/web/html/113509.html
+          USEPApicaridin,,USEPA_Picaridin_070705_Cleared_Reviews_Index.pdf,yes,https://archive.epa.gov/pesticides/chemicalsearch/chemical/foia/web/html/070705.html
+          Wang2006invitro,10.1016/j.ijpharm.2005.11.039,Wang_2006_Permeation_DEET_Oxybenzone_Three_Artificial_Membranes.pdf,no,
+          Wang2014evaluation,10.1016/j.apsb.2013.11.002,Wang_2014_Percutaneous_Permeation_Emulsion_Formulations_DEET.pdf,yes,https://www.sciencedirect.com/science/article/pii/S2211383513001032
+          WHO2001whopes4,,WHO_2001_WHOPES_Fourth_Working_Group_IR3535_KBR3023.pdf,yes,https://www.who.int/publications/i/item/who-cds-whopes-2001.2
+          WHO2009guidelines,,WHO_2009_Guidelines_Efficacy_Testing_Mosquito_Repellents_Human_Skin.pdf,yes,https://wkc.who.int/resources/publications/i/item/WHO-HTM-NTD-WHOPES-2009.4
+          Xu2014mosquito,10.1073/pnas.1417244111,Xu_2014_Mosquito_Odorant_Receptor_For_DEET.pdf,yes,https://www.pnas.org/doi/10.1073/pnas.1417244111
+          Yadav2025sustained,10.1016/j.reactfunctpolym.2025.106460,Yadav_2025_Sustained_Release_Polyurethane_Microcapsules.pdf,no,
+          Yener2022slow,10.1021/acsomega.1c05897,Yener_2022_Slow_DEET_Release_Poly_Butylene_Succinate.pdf,yes,https://pmc.ncbi.nlm.nih.gov/articles/PMC8928517/
+          CSVEOF
+
+      - name: Download open-access PDFs
+        run: python fetch_oa.py
+
+      - name: Commit results
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add pdfs report fetch_list.csv fetch_oa.py
+          git commit -m "Open-access PDFs and fetch report" || echo "nothing to commit"
+          git push
