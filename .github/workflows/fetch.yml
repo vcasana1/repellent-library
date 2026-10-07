@@ -87,19 +87,16 @@ jobs:
               is_oa = (w.get("open_access") or {}).get("is_oa")
               if is_oa and doi.startswith(("10.1186/", "10.1007/")):
                   cands.append(f"https://link.springer.com/content/pdf/{urllib.parse.quote(doi, safe='/')}.pdf")
-              try:   # v3: Europe PMC por DOI -> PMCID -> render PDF (cubre OA sin PMCID en OpenAlex)
-              _, _, d, _ = get("https://www.ebi.ac.uk/europepmc/webservices/rest/search?query=DOI:%22"
-                               + urllib.parse.quote(doi, safe="/") + "%22&format=json&resultType=lite", 40)
-              for rr in json.loads(d).get("resultList", {}).get("result", []):
-                  if rr.get("pmcid"):
-                      cands.insert(0, "https://europepmc.org/backend/ptpmcrender.fcgi?accid="
-                                   f"{rr['pmcid']}&blobtype=pdf")
-                  for ft in (rr.get("fullTextUrlList") or {}).get("fullTextUrl", []):
-                      if ft.get("documentStyle") == "pdf" and ft.get("availability") in ("Open access", "Free"):
-                          cands.append(ft["url"])
-          except Exception:
-              pass
-          seen, uniq = set(), []
+              try:   # v3: Europe PMC por DOI -> PMCID -> render PDF
+                  _, _, d, _ = get("https://www.ebi.ac.uk/europepmc/webservices/rest/search?query=DOI:%22"
+                                   + urllib.parse.quote(doi, safe="/") + "%22&format=json&resultType=lite", 40)
+                  for rr in json.loads(d).get("resultList", {}).get("result", []):
+                      if rr.get("pmcid"):
+                          cands.insert(0, "https://europepmc.org/backend/ptpmcrender.fcgi?accid="
+                                       + rr["pmcid"] + "&blobtype=pdf")
+              except Exception:
+                  pass
+              seen, uniq = set(), []
               for c in cands:
                   if c not in seen:
                       seen.add(c)
